@@ -8,6 +8,11 @@ use axtask::current;
 use axtask::TaskExtRef;
 use axhal::paging::MappingFlags;
 use arceos_posix_api as api;
+use axerrno::LinuxResult;
+use axhal::mem::VirtAddr;
+use memory_addr::{MemoryAddr, VirtAddrRange};
+use alloc::vec;
+use alloc::vec::Vec;
 
 const SYS_IOCTL: usize = 29;
 const SYS_OPENAT: usize = 56;
@@ -21,6 +26,9 @@ const SYS_SET_TID_ADDRESS: usize = 96;
 const SYS_MMAP: usize = 222;
 
 const AT_FDCWD: i32 = -100;
+
+const SEEK_SET: i32 = 0;
+const SEEK_CUR: i32 = 1;
 
 /// Macro to generate syscall body
 ///
@@ -131,16 +139,82 @@ fn handle_syscall(tf: &TrapFrame, syscall_num: usize) -> isize {
     ret
 }
 
-#[allow(unused_variables)]
 fn sys_mmap(
     addr: *mut usize,
     length: usize,
     prot: i32,
     flags: i32,
     fd: i32,
-    _offset: isize,
+    offset: isize,
 ) -> isize {
-    unimplemented!("no sys_mmap!");
+    syscall_body!(sys_mmap, {
+        if length == 0 || offset < 0 {
+            return Err(LinuxError::EINVAL);
+        }
+        let prot = MmapProt::from_bits_truncate(prot);
+        let flags = MmapFlags::from_bits_truncate(flags);
+        // Page tables work on whole pages, so round the length up to 4 KiB.
+        let map_len = memory_addr::align_up_4k(length);
+
+        let curr = current();
+        let mut aspace = curr.task_ext().aspace.lock();
+
+        // Choose where to map: the exact address for MAP_FIXED, otherwise
+        // the first free range at or after the hint (NULL means "anywhere").
+        let start = if flags.contains(MmapFlags::MAP_FIXED) {
+            let start = VirtAddr::from(addr as usize);
+            if !start.is_aligned_4k() {
+                return Err(LinuxError::EINVAL);
+            }
+            aspace.unmap(start, map_len)?;
+            start
+        } else {
+            let hint = VirtAddr::from(addr as usize).align_down_4k();
+            let limit = VirtAddrRange::from_start_size(aspace.base(), aspace.size());
+            aspace
+                .find_free_area(hint, map_len, limit)
+                .ok_or(LinuxError::ENOMEM)?
+        };
+
+        // Allocate physical frames and map them right away (populate = true),
+        // so we can fill them in before the user touches the memory.
+        aspace.map_alloc(start, map_len, prot.into(), true)?;
+
+        if !flags.contains(MmapFlags::MAP_ANONYMOUS) {
+            // File-backed mapping: copy `length` bytes from the file starting at
+            // `offset` into the new pages. Anonymous mappings stay zero-filled.
+            let buf = read_file_at(fd, offset as u64, length)?;
+            aspace.write(start, &buf)?;
+        }
+        Ok(start.as_usize())
+    })
+}
+
+/// Reads up to `len` bytes of file `fd` starting at `offset`, leaving the
+/// file's current position unchanged (mmap must not move the file cursor).
+fn read_file_at(fd: i32, offset: u64, len: usize) -> LinuxResult<Vec<u8>> {
+    let file = api::get_file_like(fd)?;
+    let old_pos = api::sys_lseek(fd, 0, SEEK_CUR);
+    if old_pos < 0 {
+        return Err(LinuxError::EBADF);
+    }
+    if api::sys_lseek(fd, offset as _, SEEK_SET) < 0 {
+        return Err(LinuxError::EINVAL);
+    }
+
+    let mut buf = vec![0u8; len];
+    let mut filled = 0;
+    while filled < len {
+        let n = file.read(&mut buf[filled..])?;
+        if n == 0 {
+            break; // end of file: the rest of the mapping stays zero
+        }
+        filled += n;
+    }
+    buf.truncate(filled);
+
+    api::sys_lseek(fd, old_pos, SEEK_SET);
+    Ok(buf)
 }
 
 fn sys_openat(dfd: c_int, fname: *const c_char, flags: c_int, mode: api::ctypes::mode_t) -> isize {
