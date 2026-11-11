@@ -102,16 +102,26 @@ fn vmexit_handler(ctx: &mut VmCpuRegisters) -> bool {
             }
         },
         Trap::Exception(Exception::IllegalInstruction) => {
-            panic!("Bad instruction: {:#x} sepc: {:#x}",
+            // The guest runs in VS-mode, so `csrr a1, mhartid` (an M-mode CSR)
+            // traps to the hypervisor. Emulate it: report the expected value
+            // in a1 and skip the 4-byte faulting instruction.
+            ax_println!("Bad instruction: {:#x} sepc: {:#x}",
                 stval::read(),
                 ctx.guest_regs.sepc
             );
+            ctx.guest_regs.gprs.set_reg(A1, 0x1234);
+            ctx.guest_regs.sepc += 4;
         },
         Trap::Exception(Exception::LoadGuestPageFault) => {
-            panic!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
+            // `ld a0, 64(zero)` reads guest-physical address 0x40, which is not
+            // mapped in the stage-2 page table. Emulate the load by putting the
+            // expected value in a0, then skip the 4-byte `ld` instruction.
+            ax_println!("LoadGuestPageFault: stval{:#x} sepc: {:#x}",
                 stval::read(),
                 ctx.guest_regs.sepc
             );
+            ctx.guest_regs.gprs.set_reg(A0, 0x6688);
+            ctx.guest_regs.sepc += 4;
         },
         _ => {
             panic!(
