@@ -133,14 +133,52 @@ impl VfsNodeOps for RootDirectory {
     }
 
     fn rename(&self, src_path: &str, dst_path: &str) -> VfsResult {
-        self.lookup_mounted_fs(src_path, |fs, rest_path| {
-            if rest_path.is_empty() {
-                ax_err!(PermissionDenied) // cannot rename mount points
-            } else {
-                fs.root_dir().rename(rest_path, dst_path)
+        self.lookup_mounted_fs(src_path, |src_fs, src_rest| {
+            if src_rest.is_empty() {
+                return ax_err!(PermissionDenied); // cannot rename mount points
             }
+            // Resolve `dst_path` too, so the filesystem receives a path relative
+            // to its own root (e.g. "/tmp/f2" becomes "f2" inside the /tmp fs).
+            self.lookup_mounted_fs(dst_path, |dst_fs, dst_rest| {
+                if dst_rest.is_empty() {
+                    return ax_err!(PermissionDenied);
+                }
+                if !Arc::ptr_eq(&src_fs, &dst_fs) {
+                    return ax_err!(Unsupported); // no rename across filesystems
+                }
+                let root = src_fs.root_dir();
+                match root.rename(src_rest, dst_rest) {
+                    // Some filesystems (e.g. the ramfs from crates.io mounted at
+                    // /tmp) do not implement `rename`; emulate it for files.
+                    Err(AxError::Unsupported) => rename_by_copy(&root, src_rest, dst_rest),
+                    res => res,
+                }
+            })
         })
     }
+}
+
+/// Emulates `rename` for a regular file using only basic VFS operations:
+/// create `dst`, copy the contents of `src` into it, then remove `src`.
+fn rename_by_copy(root: &VfsNodeRef, src_path: &str, dst_path: &str) -> VfsResult {
+    let src = root.clone().lookup(src_path)?;
+    if !src.get_attr()?.is_file() {
+        return ax_err!(Unsupported); // directories cannot be renamed this way
+    }
+    root.create(dst_path, VfsNodeType::File)?;
+    let dst = root.clone().lookup(dst_path)?;
+
+    let mut buf = [0u8; 512];
+    let mut offset = 0;
+    loop {
+        let n = src.read_at(offset, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        dst.write_at(offset, &buf[..n])?;
+        offset += n as u64;
+    }
+    root.remove(src_path)
 }
 
 pub(crate) fn init_rootfs(disk: crate::dev::Disk) {
